@@ -65,14 +65,19 @@ const OWN_I2C_ADDR: u8 = 0x10;
 // Server loop
 // ---------------------------------------------------------------------------
 
+#[inline(never)]
 fn mctp_server_loop() -> Result<()> {
     pw_log::info!("MCTP server starting");
+
+    pw_log::info!("p -2");
 
     // I2C notification client: receives slave-mode interrupts via Signals::USER.
     let mut i2c_notify = IpcI2cClient::new(handle::I2C);
     i2c_notify
         .register_notification(BusIndex::BUS_0, 0)
         .map_err(|_| pw_status::Error::Internal)?;
+
+    pw_log::info!("p -1");
 
     // Separate handle for the sender — I2cSender takes ownership.
     let sender = I2cSender::new(IpcI2cClient::new(handle::I2C), BusIndex::BUS_0, OWN_I2C_ADDR);
@@ -83,90 +88,95 @@ fn mctp_server_loop() -> Result<()> {
         sender,
     );
 
+    pw_log::info!("p0");
     let mut request_buf = [0u8; MAX_REQUEST_SIZE];
     let mut response_buf = [0u8; MAX_RESPONSE_SIZE];
     let mut recv_buf = [0u8; MAX_PAYLOAD_SIZE];
 
-    // Register both event sources with the WaitGroup.
-    // user_data=0 → IPC from a client  (MCTP channel READABLE)
-    // user_data=1 → I2C slave notification (I2C channel USER)
-    syscall::wait_group_add(handle::WG, handle::MCTP, Signals::READABLE, 0usize)?;
-    syscall::wait_group_add(handle::WG, handle::I2C,  Signals::USER,     1usize)?;
+    // Polling mode: no WaitGroup, no interrupts.
+    // Wait on IPC channel, poll I2C slave data on each iteration.
 
     loop {
-        let ev = syscall::object_wait(handle::WG, Signals::READABLE, Instant::MAX)?;
+        syscall::object_wait(handle::MCTP, Signals::READABLE, Instant::MAX)?;
 
-        if ev.user_data == 1 {
-            // Inbound I2C data: drain pending messages, decode I2C framing,
-            // feed raw MCTP packets into the router.
-            let mut msgs = [TargetMessage::default(); 1];
-            if let Ok(n) = i2c_notify.get_pending_messages(BusIndex::BUS_0, &mut msgs) {
-                for msg in &msgs[..n] {
-                    if let Ok((pkt, _src_addr)) = receiver.decode(msg) {
-                        let _ = server.inbound(pkt);
-                    }
+        pw_log::info!("p1");
+
+        // Poll for inbound I2C data: drain pending messages, decode I2C framing,
+        // feed raw MCTP packets into the router.
+        let mut msgs = [TargetMessage::default(); 1];
+        if let Ok(n) = i2c_notify.get_pending_messages(BusIndex::BUS_0, &mut msgs) {
+            for msg in &msgs[..n] {
+                if let Ok((pkt, _src_addr)) = receiver.decode(msg) {
+                    let _ = server.inbound(pkt);
                 }
             }
-            // After routing inbound packets, fulfil any clients parked on recv.
-            let (_, ready) = server.update(0, &mut recv_buf);
-            for (_, result) in ready {
-                match result {
-                    RecvResult::Message(meta) => {
-                        let payload = &recv_buf[..meta.payload_size];
-                        if let Ok(len) = wire::encode_recv_response(
-                            &mut response_buf,
-                            meta.msg_type,
-                            meta.msg_ic,
-                            meta.remote_eid,
-                            meta.msg_tag,
-                            payload,
-                        ) {
-                            let _ = syscall::channel_respond(
-                                handle::MCTP,
-                                &response_buf[..len],
-                            );
-                        }
-                    }
-                    RecvResult::TimedOut => {
-                        let resp = openprot_mctp_api::wire::MctpResponseHeader::error(
-                            ResponseCode::TimedOut,
-                        );
-                        response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE]
-                            .copy_from_slice(&resp.to_bytes());
+        }
+
+        pw_log::info!("p2");
+        // After routing inbound packets, fulfil any clients parked on recv.
+        let (_, ready) = server.update(0, &mut recv_buf);
+        for (_, result) in ready {
+            match result {
+                RecvResult::Message(meta) => {
+                    pw_log::info!("p2a");
+                    let payload = &recv_buf[..meta.payload_size];
+                    if let Ok(len) = wire::encode_recv_response(
+                        &mut response_buf,
+                        meta.msg_type,
+                        meta.msg_ic,
+                        meta.remote_eid,
+                        meta.msg_tag,
+                        payload,
+                    ) {
                         let _ = syscall::channel_respond(
                             handle::MCTP,
-                            &response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE],
+                            &response_buf[..len],
                         );
                     }
                 }
-            }
-        } else {
-            // IPC from a client — channel_read is non-blocking here because
-            // the WaitGroup only fires after READABLE is set.
-            let len = syscall::channel_read(handle::MCTP, 0, &mut request_buf)?;
+                RecvResult::TimedOut => {
 
-            if len < MctpRequestHeader::SIZE {
-                // Truncated request — respond with error
-                let resp = openprot_mctp_api::wire::MctpResponseHeader::error(ResponseCode::BadArgument);
-                response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE]
-                    .copy_from_slice(&resp.to_bytes());
-                syscall::channel_respond(
-                    handle::MCTP,
-                    &response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE],
-                )?;
-                continue;
+                    pw_log::info!("p2b");
+                    let resp = openprot_mctp_api::wire::MctpResponseHeader::error(
+                        ResponseCode::TimedOut,
+                    );
+                    response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE]
+                        .copy_from_slice(&resp.to_bytes());
+                    let _ = syscall::channel_respond(
+                        handle::MCTP,
+                        &response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE],
+                    );
+                }
             }
+        }
 
-            // Dispatch; for deferred Recv the response is sent later from
-            // the I2C inbound path via server.update().
-            if let Some(response_len) = dispatch::dispatch_mctp_op(
-                &request_buf[..len],
-                &mut response_buf,
-                &mut server,
-                &mut recv_buf,
-            ) {
-                syscall::channel_respond(handle::MCTP, &response_buf[..response_len])?;
-            }
+        // IPC from a client — channel_read is non-blocking here because
+        // object_wait already confirmed READABLE.
+        let len = syscall::channel_read(handle::MCTP, 0, &mut request_buf)?;
+
+        pw_log::info!("p3");
+        if len < MctpRequestHeader::SIZE {
+            // Truncated request — respond with error
+            let resp = openprot_mctp_api::wire::MctpResponseHeader::error(ResponseCode::BadArgument);
+            response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE]
+                .copy_from_slice(&resp.to_bytes());
+            syscall::channel_respond(
+                handle::MCTP,
+                &response_buf[..openprot_mctp_api::wire::MctpResponseHeader::SIZE],
+            )?;
+            continue;
+        }
+
+        pw_log::info!("p4");
+        // Dispatch; for deferred Recv the response is sent later from
+        // the I2C inbound path via server.update().
+        if let Some(response_len) = dispatch::dispatch_mctp_op(
+            &request_buf[..len],
+            &mut response_buf,
+            &mut server,
+            &mut recv_buf,
+        ) {
+            syscall::channel_respond(handle::MCTP, &response_buf[..response_len])?;
         }
     }
 }
