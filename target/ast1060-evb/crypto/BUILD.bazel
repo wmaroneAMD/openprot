@@ -6,6 +6,8 @@ load("@pigweed//pw_kernel/tooling:system_image.bzl", "system_image", "system_ima
 load("@pigweed//pw_kernel/tooling:target_codegen.bzl", "target_codegen")
 load("@pigweed//pw_kernel/tooling:target_linker_script.bzl", "target_linker_script")
 load("@pigweed//pw_kernel/tooling/panic_detector:rust_binary_no_panics_test.bzl", "rust_binary_no_panics_test")
+load("//target:uart_boot_image.bzl", "uart_boot_image")
+load("//target/ast1060-evb/harness:uart_upload_test.bzl", "uart_upload", "uart_upload_test")
 
 system_image(
     name = "crypto",
@@ -30,6 +32,35 @@ rust_binary_no_panics_test(
     name = "no_panics_test",
     binary = ":crypto",
     tags = ["kernel"],
+)
+
+# Generate UART bootable image with size header for physical board flashing
+uart_boot_image(
+    name = "crypto_uart",
+    src = ":crypto",
+    out = "crypto_uart.bin",
+)
+
+# UART upload test - uploads firmware and monitors test execution
+# Run with: bazel test :crypto_uart_test --test_env=UART_DEVICE=/dev/ttyUSB0
+uart_upload_test(
+    name = "crypto_uart_test",
+    image = ":crypto_uart",
+    skip_gpio = True,
+    tags = [
+        "exclusive",
+        "local",
+        "manual",
+    ],
+    test_timeout = 300,
+)
+
+# Upload-only target for manual testing
+# Run with: bazel run :upload_crypto
+uart_upload(
+    name = "upload_crypto",
+    image = ":crypto_uart",
+    skip_gpio = True,
 )
 
 filegroup(
