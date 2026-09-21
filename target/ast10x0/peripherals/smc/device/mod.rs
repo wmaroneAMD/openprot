@@ -5,8 +5,10 @@
 
 mod block_device;
 mod flash;
+mod hal_impl;
 
 pub use block_device::{BlockDeviceInfo, SpiNorBlockDevice};
 pub use flash::{
     FlashAddressingPolicy, FlashCommandProfile, JedecId, SpiNorFlash, SpiNorFlashDevice,
 };
+pub use hal_impl::{ImmediateBlocking, SpiNorFlashDriver};

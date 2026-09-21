@@ -45,6 +45,22 @@ fn encode_addr_cmd(opcode: u8, offset: u32, width: AddressWidth) -> ([u8; 5], us
     }
 }
 
+/// Check that a page-program request is legal for a device with `page_size`.
+///
+/// SPI NOR page program wraps to the start of the page when it runs off the
+/// end, so the only hardware constraint is that the write stay inside a single
+/// page. The start offset need not be page-aligned.
+fn page_program_fits(offset: u32, len: usize, page_size: usize) -> bool {
+    if page_size == 0 || len == 0 || len > page_size {
+        return false;
+    }
+    let start = offset as usize;
+    let Some(last) = start.checked_add(len - 1) else {
+        return false;
+    };
+    start / page_size == last / page_size
+}
+
 /// Minimal SPI NOR flash device API.
 pub trait SpiNorFlashDevice {
     /// Read bytes from flash at `offset` into `buf`.
@@ -406,6 +422,11 @@ impl<'a> SpiNorFlash<'a> {
         self.command_profile
     }
 
+    /// Geometry this facade was configured with.
+    pub fn config(&self) -> FlashConfig {
+        self.cfg
+    }
+
     /// Validate a device-local offset before handing it to the controller.
     ///
     /// `FmcReady::read` / `SpiReady::read` already select the per-CS AHB
@@ -436,11 +457,7 @@ impl<'a> SpiNorFlash<'a> {
     }
 
     fn validate_page_program(&self, offset: u32, data: &[u8]) -> Result<(), SmcError> {
-        let page_size = self.cfg.page_size as usize;
-        if page_size == 0 || data.is_empty() || data.len() > page_size {
-            return Err(SmcError::InvalidCapacity);
-        }
-        if (offset as usize) % page_size != 0 {
+        if !page_program_fits(offset, data.len(), self.cfg.page_size as usize) {
             return Err(SmcError::InvalidCapacity);
         }
         self.validate_range(offset, data.len())
@@ -563,8 +580,8 @@ impl SpiNorFlashDevice for SpiNorFlash<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        commands, compare_chunked, encode_addr_cmd, expect_jedec_match, FlashAddressingPolicy,
-        FlashCommandProfile, JedecId, SpiNorFlash,
+        commands, compare_chunked, encode_addr_cmd, expect_jedec_match, page_program_fits,
+        FlashAddressingPolicy, FlashCommandProfile, JedecId, SpiNorFlash,
     };
     use crate::smc::types::{AddressWidth, FlashConfig, SmcError};
 
@@ -678,6 +695,26 @@ mod tests {
             compare_chunked(read, 0, &expected, 256),
             Err(SmcError::Timeout)
         );
+    }
+
+    #[test]
+    fn page_program_accepts_unaligned_write_inside_one_page() {
+        assert!(page_program_fits(0x3c, 6, 256));
+        assert!(page_program_fits(0xff, 1, 256));
+        assert!(page_program_fits(0x100, 256, 256));
+    }
+
+    #[test]
+    fn page_program_rejects_page_boundary_crossing() {
+        assert!(!page_program_fits(0xfe, 4, 256));
+        assert!(!page_program_fits(0x01, 256, 256));
+    }
+
+    #[test]
+    fn page_program_rejects_degenerate_inputs() {
+        assert!(!page_program_fits(0, 0, 256));
+        assert!(!page_program_fits(0, 257, 256));
+        assert!(!page_program_fits(0, 1, 0));
     }
 
     #[test]

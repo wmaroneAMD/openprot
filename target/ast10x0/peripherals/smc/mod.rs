@@ -17,8 +17,8 @@ pub mod types;
 
 pub use controller::{Ready, ReadySmc, Smc, UninitSmc, Uninitialized};
 pub use device::{
-    BlockDeviceInfo, FlashAddressingPolicy, FlashCommandProfile, JedecId, SpiNorBlockDevice,
-    SpiNorFlash, SpiNorFlashDevice,
+    BlockDeviceInfo, FlashAddressingPolicy, FlashCommandProfile, ImmediateBlocking, JedecId,
+    SpiNorBlockDevice, SpiNorFlash, SpiNorFlashDevice, SpiNorFlashDriver,
 };
 pub use fmc::{FmcReady, FmcUninit};
 pub use interrupts::{SmcInterrupt, SmcInterruptDecoder};

@@ -68,6 +68,7 @@ rust_library(
         "smc/controller.rs",
         "smc/device/block_device.rs",
         "smc/device/flash.rs",
+        "smc/device/hal_impl.rs",
         "smc/device/mod.rs",
         "smc/fmc.rs",
         "smc/helpers.rs",
@@ -97,6 +98,8 @@ rust_library(
     target_compatible_with = TARGET_COMPATIBLE_WITH,
     deps = [
         "//hal/blocking",
+        "//hal/blocking/flash:driver",
+        "//util/types",
         "@ast1060_pac",
         "@pigweed//pw_log/rust:pw_log",
         "@rust_crates//:bitflags",

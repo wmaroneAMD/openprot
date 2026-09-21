@@ -10,10 +10,11 @@
 use ast10x0_peripherals::scu::pinctrl::PINCTRL_FMC_QUAD;
 use ast10x0_peripherals::scu::ScuRegisters;
 use ast10x0_peripherals::smc::{
-    ChipSelect, FlashConfig, FmcUninit, SmcConfig, SmcController, SmcError, SmcTopology,
-    SpiNorFlash, SpiNorFlashDevice,
+    ChipSelect, FlashConfig, FmcUninit, ImmediateBlocking, SmcConfig, SmcController, SmcError,
+    SmcTopology, SpiNorFlash, SpiNorFlashDevice, SpiNorFlashDriver,
 };
 use console_backend::console_backend_write_all;
+use hal_flash::{BlockingFlash, Flash, FlashAddress};
 use target_common::{declare_target, TargetInterface};
 use {console_backend as _, entry as _};
 
@@ -41,9 +42,14 @@ const TEST_OFFSET: u32 = 0x10_0000;
 const TEST_LEN: usize = 256;
 const TEST_SECTOR_LEN: usize = 4096;
 
+/// Start of the HAL-path write: unaligned, two bytes before a page boundary.
+const HAL_TEST_OFFSET: u32 = TEST_OFFSET + 0xfe;
+/// Long enough to straddle three SPI NOR page-program windows (0xfe..0x202).
+const HAL_TEST_LEN: usize = 0x104;
+
 pub struct Target {}
 
-fn fill_test_pattern(out: &mut [u8; TEST_LEN]) {
+fn fill_test_pattern(out: &mut [u8]) {
     let mut i = 0usize;
     while i < out.len() {
         out[i] = (i as u8).wrapping_mul(17).wrapping_add(0x5a);
@@ -57,6 +63,47 @@ fn expect_erased(buf: &[u8]) -> Result<(), SmcError> {
             return Err(SmcError::HardwareError);
         }
     }
+    Ok(())
+}
+
+/// Exercise the same device through the portable `hal_flash::Flash` interface.
+///
+/// This covers what the raw device API cannot do on its own: an unaligned
+/// program that spans several page-program windows, split and reassembled by
+/// `BlockingFlash` on top of `SpiNorFlashDriver`.
+fn run_hal_flash_path(flash: &mut SpiNorFlash<'_>) -> Result<(), SmcError> {
+    pw_log::info!("=== HAL flash path: geometry ===");
+    let mut hal = BlockingFlash {
+        driver: SpiNorFlashDriver::new(flash)?,
+        blocking: ImmediateBlocking,
+    };
+
+    let (size, erase_size, erasable) = hal.geometry()?;
+    if size.get() != CS1_CONFIG.capacity_mb as usize * 1024 * 1024
+        || erase_size.get() != TEST_SECTOR_LEN
+        || erasable != 1 << 12
+    {
+        return Err(SmcError::HardwareError);
+    }
+
+    pw_log::info!("=== HAL flash path: erase sector ===");
+    hal.erase(FlashAddress::new(TEST_OFFSET), erase_size)?;
+
+    let mut erased = [0u8; TEST_LEN];
+    hal.read(FlashAddress::new(HAL_TEST_OFFSET), &mut erased)?;
+    expect_erased(&erased)?;
+
+    pw_log::info!("=== HAL flash path: unaligned cross-page program ===");
+    let mut pattern = [0u8; HAL_TEST_LEN];
+    fill_test_pattern(&mut pattern);
+    hal.program(FlashAddress::new(HAL_TEST_OFFSET), &pattern)?;
+
+    let mut read_back = [0u8; HAL_TEST_LEN];
+    hal.read(FlashAddress::new(HAL_TEST_OFFSET), &mut read_back)?;
+    if read_back != pattern {
+        return Err(SmcError::HardwareError);
+    }
+
     Ok(())
 }
 
@@ -160,6 +207,8 @@ fn run_smc_fmc_cs1_write_test() -> Result<(), SmcError> {
     if !flash.verify(TEST_OFFSET, &pattern)? {
         return Err(SmcError::HardwareError);
     }
+
+    run_hal_flash_path(&mut flash)?;
 
     restore_sector(&mut flash, original)?;
 
