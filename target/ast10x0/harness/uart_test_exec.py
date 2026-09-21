@@ -58,12 +58,31 @@ except ImportError:
     sys.exit(1)
 
 
+class UartLost(Exception):
+    """The USB serial device went away mid-run (unplugged or powered off)."""
+
+
 class UartTestExecutor:
     """Handles AST1060 UART test execution with GPIO control."""
 
     # Default success/failure patterns for test monitoring
     SUCCESS_PATTERNS = ["COMPLETE", "TEST PASSED", "All tests passed"]
     FAILURE_PATTERNS = ["panic", "FAIL", "ERROR", "abort"]
+
+    # --zephyr: drive an already-running Zephyr image into UART boot mode.
+    # SCU510[8] is "Enable Boot from Uart5"; it lives in the RstPwr domain, so
+    # it survives the reset that follows and the ROM comes up on UART5.
+    ZEPHYR_PROMPT = "uart:~$"
+    SCU510 = 0x7E6E2510
+    SCU510_UART5_BOOT = 0x100
+
+    # The two Zephyr builds in the field disagree on the memory-write shell
+    # command. Everything else -- prompt, kernel command -- is common.
+    ZEPHYR_DIALECTS = {
+        "z1": "devmem 0x{addr:08X} 32 0x{val:X}",
+        "z2": "mw 0x{addr:08X} 0x{val:X}",
+    }
+    ZEPHYR_REBOOT = "kernel reboot cold"
 
     def __init__(self, args):
         self.args = args
@@ -227,6 +246,8 @@ class UartTestExecutor:
 
             return ""
 
+        except serial.SerialException as e:
+            raise UartLost(self.args.uart_device) from e
         except Exception as e:
             self.log(f"Serial read error: {e}")
             return ""
@@ -245,14 +266,83 @@ class UartTestExecutor:
             self.serial_port.flush()
             return bytes_written == len(data)
 
+        except serial.SerialException as e:
+            raise UartLost(self.args.uart_device) from e
         except Exception as e:
             self.log(f"Serial write error: {e}")
             return False
+
+    def _wait_for_text(self, needle: str, timeout: float, label: str) -> bool:
+        """Read UART until `needle` appears, echoing output raw (no detokenizing)."""
+        start_time = time.time()
+        buffer = ""
+
+        while time.time() - start_time < timeout:
+            data = self.read_serial_data(0.1)
+            if data:
+                buffer += data
+                if not self.args.quiet:
+                    print(data, end="", flush=True)
+                if needle in buffer:
+                    return True
+                buffer = buffer[-256:]
+
+        self.log(f"\nTimeout waiting for {label}")
+        return False
+
+    def _zephyr_write_cmd(self) -> str:
+        """Render the SCU510 write for the selected Zephyr build."""
+        return self.ZEPHYR_DIALECTS[self.args.zephyr_dialect].format(
+            addr=self.SCU510, val=self.SCU510_UART5_BOOT
+        )
+
+    def zephyr_prep(self, timeout: int = 30) -> bool:
+        """Drive a running Zephyr shell into UART boot mode, then reset.
+
+        Raises the shell prompt with a bare newline, sets SCU510[8], then
+        reboots. The caller picks up the normal flow from wait_for_uart_ready().
+        """
+        if self.args.skip_uart:
+            self.log("Skipping Zephyr shell prep")
+            return True
+
+        write_cmd = self._zephyr_write_cmd()
+
+        self.log(
+            f"Zephyr {self.args.zephyr_dialect}: waiting for shell prompt "
+            f"('{self.ZEPHYR_PROMPT}')..."
+        )
+
+        if self.args.dry_run:
+            for cmd in (write_cmd, self.ZEPHYR_REBOOT):
+                self.log(f"DRY RUN: Would send '{cmd}'")
+            return True
+
+        if not self.write_serial_data(b"\r\n"):
+            return False
+        if not self._wait_for_text(self.ZEPHYR_PROMPT, timeout, "Zephyr shell prompt"):
+            return False
+
+        self.log(f"\nZephyr: {write_cmd}")
+        if not self.write_serial_data(write_cmd.encode() + b"\r\n"):
+            return False
+        if not self._wait_for_text(self.ZEPHYR_PROMPT, timeout, "Zephyr shell prompt"):
+            return False
+
+        # Reboot last: there is no prompt to come back to.
+        self.log(f"\nZephyr: {self.ZEPHYR_REBOOT}")
+        return self.write_serial_data(self.ZEPHYR_REBOOT.encode() + b"\r\n")
 
     def wait_for_uart_ready(self, timeout: int = 30) -> bool:
         """Wait for 'U' character indicating UART bootloader ready."""
         if self.args.skip_uart:
             self.log("Skipping UART ready check")
+            return True
+
+        # Guarded here rather than at each call site so every path that would
+        # block on 'U' honours --force.
+        if self.args.force:
+            self.log("Force: not waiting for 'U', uploading immediately")
             return True
 
         self.log(f"Waiting for UART ready signal ('U') with {timeout}s timeout...")
@@ -299,7 +389,17 @@ class UartTestExecutor:
             with open(firmware_path, "rb") as f:
                 firmware_data = f.read()
 
-            self.log(f"Uploading {len(firmware_data)} bytes...")
+            # The loader expects a 4-byte little-endian length header, and the
+            # image padded out to that 4-byte-aligned length. Matches
+            # pi_test_runner._upload_firmware.
+            aligned = (len(firmware_data) + 3) & ~3
+            padding = aligned - len(firmware_data)
+
+            self.log(f"Uploading {len(firmware_data)} bytes ({padding} padding)...")
+
+            if not self.write_serial_data(aligned.to_bytes(4, "little")):
+                self.log("Failed to write length header")
+                return False
 
             # Upload firmware in chunks
             chunk_size = 1024
@@ -319,6 +419,10 @@ class UartTestExecutor:
                 if not self.args.quiet and bytes_sent % (chunk_size * 10) == 0:
                     progress = (bytes_sent * 100) // len(firmware_data)
                     print(f"\rProgress: {progress}%", end="", flush=True)
+
+            if padding and not self.write_serial_data(bytes(padding)):
+                self.log("Failed to write padding")
+                return False
 
             if not self.args.quiet:
                 print()
@@ -427,6 +531,15 @@ Examples:
 
   # Bazel test mode (exit code indicates pass/fail)
   ./uart_test_exec.py --bazel-test /dev/ttyUSB0 firmware.bin
+
+  # Board is running Zephyr: flip it to UART boot, then upload
+  ./uart_test_exec.py --zephyr /dev/ttyUSB0 firmware.bin
+
+  # Same, against the older shell that uses mw/md instead of devmem
+  ./uart_test_exec.py --zephyr --z2 /dev/ttyUSB0 firmware.bin
+
+  # Don't wait for 'U' -- start the upload the moment the port is open
+  ./uart_test_exec.py --skip-gpio --force /dev/ttyUSB0 firmware.bin
         """,
     )
 
@@ -512,8 +625,46 @@ Examples:
         action="store_true",
         help="Skip GPIO operations but still monitor tests",
     )
+    parser.add_argument(
+        "--zephyr",
+        action="store_true",
+        help="Drive a running Zephyr shell into UART boot mode (sets SCU510[8], "
+        "cold reboots) before the normal upload flow. Implies --skip-gpio.",
+    )
+    parser.add_argument(
+        "--z1",
+        dest="zephyr_dialect",
+        action="store_const",
+        const="z1",
+        help="Zephyr build using 'devmem <addr> <width> <val>' (default)",
+    )
+    parser.add_argument(
+        "--z2",
+        dest="zephyr_dialect",
+        action="store_const",
+        const="z2",
+        help="Zephyr build using 'mw <addr> <val>' / 'md <addr> <count>'",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip the UART ready ('U') wait and start the upload immediately. "
+        "Requires --upload-only, --zephyr, or --skip-gpio.",
+    )
 
     args = parser.parse_args()
+
+    if args.zephyr_dialect and not args.zephyr:
+        parser.error("--z1/--z2 only apply with --zephyr")
+
+    if args.force and not (args.upload_only or args.zephyr or args.skip_gpio):
+        parser.error("--force requires --upload-only, --zephyr, or --skip-gpio")
+
+    # The board is driven entirely over its existing console, so the GPIO strap
+    # sequence is neither needed nor wanted.
+    if args.zephyr:
+        args.skip_gpio = True
+        args.zephyr_dialect = args.zephyr_dialect or "z1"
 
     # Validate pw_tokenizer / --elf argument consistency
     if os.environ.get("PW_TOK_ROOT") and not args.elf:
@@ -530,6 +681,9 @@ Examples:
         sys.exit(1)
 
     # Validate arguments
+    if args.zephyr and not (args.uart_device and args.firmware):
+        parser.error("--zephyr requires UART device and firmware file")
+
     if args.upload_only:
         if not args.uart_device or not args.firmware:
             parser.error("--upload-only requires UART device and firmware file")
@@ -582,6 +736,11 @@ Examples:
             try:
                 if not executor.open_serial():
                     return 1
+                if args.zephyr:
+                    if not executor.zephyr_prep():
+                        return 1
+                    if not executor.wait_for_uart_ready():
+                        return 1
                 if not executor.upload_firmware():
                     return 1
                 if executor.monitor_test_execution():
@@ -600,6 +759,9 @@ Examples:
                 executor.log("Test execution failed!")
                 return 1
 
+    except UartLost as e:
+        print(f"\nLost contact with {e}, exiting.", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         executor.log("\nInterrupted by user")
         return 130

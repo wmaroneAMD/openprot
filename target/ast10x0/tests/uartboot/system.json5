@@ -1,0 +1,29 @@
+// Licensed under the Apache-2.0 license
+// SPDX-License-Identifier: Apache-2.0
+
+// OpenPRoT uartboot bootstrap image for the AST1060 — Hello World.
+//
+// Kernel-only: no `apps`, so no processes, no IPC, no MPU regions. This is the
+// shape the UART loader needs — it must be free to poke FMC/SCU MMIO and to
+// hand the CPU to an image it has staged.
+//
+// Geometry is erot's: the kernel claims SRAM through the RAM_NC boundary. A
+// loader that stages a received image in SRAM and jumps to it will need this
+// re-cut to reserve a landing zone; that is a relink, nothing more.
+//
+//   0x00000000 - 0x00000500  vector table (1280 B)
+//   0x00000500 - 0x00040500  kernel flash (256 KB)
+//   0x00040500 - 0x000A0000  kernel RAM (382 KB, ends at RAM_NC)
+{
+    arch: {
+        type: "armv7m",
+        vector_table_start_address: 0x00000000,
+        vector_table_size_bytes: 1280,
+    },
+    kernel: {
+        flash_start_address: 0x00000500,
+        flash_size_bytes: 262144,
+        ram_start_address: 0x00040500,
+        ram_size_bytes: 391936, // ends at RAM_NC boundary (0x000A0000)
+    },
+}
