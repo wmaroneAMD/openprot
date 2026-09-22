@@ -552,6 +552,15 @@ pub const PINCTRL_I2C1: &[PinctrlPin] = &[PIN_SCU414_30, PIN_SCU414_31];
 /// I2C communication between the two AST1060 daughter cards.
 pub const PINCTRL_I2C2: &[PinctrlPin] = &[PIN_SCU418_0, PIN_SCU418_1];
 
+/// I2C8 pin group: SCL9/SDA9 mux selection on SCU418[12:13].
+///
+/// The SVD names these EnblSCL9FnPin/EnblSDA9FnPin, corresponding to PAC
+/// peripheral I2c8 (controller 8, base 0x7e7b_0480) under the same 1-based
+/// SVD naming as [`PINCTRL_I2C1`]/[`PINCTRL_I2C2`]. These are the GPIOJ4/J5
+/// balls, which route to the parent board's AST2600 SCL1/SDA1 (GPIOJ0/J1,
+/// balls B20/A20) — Linux `/dev/i2c-0` on the BMC.
+pub const PINCTRL_I2C8: &[PinctrlPin] = &[PIN_SCU418_12, PIN_SCU418_13];
+
 /// GPIOA pin groups: GPIO mux selection.
 pub const PINCTRL_GPIOA0: &[PinctrlPin] = &[CLR_PIN_SCU410_0, CLR_PIN_SCU4B0_0, CLR_PIN_SCU690_0];
 pub const PINCTRL_GPIOA1: &[PinctrlPin] = &[CLR_PIN_SCU410_1, CLR_PIN_SCU4B0_1, CLR_PIN_SCU690_1];

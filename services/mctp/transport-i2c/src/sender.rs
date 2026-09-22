@@ -10,6 +10,16 @@ use embedded_hal::i2c::I2c;
 use mctp::Result;
 use mctp_lib::i2c::{MctpI2cEncap, MCTP_I2C_MAXMTU};
 
+/// DSP0236 baseline transmission unit: the payload size every MCTP endpoint
+/// must accept without negotiation.
+///
+/// `MCTP_I2C_MAXMTU` is what the I2C *medium* can carry, not what a peer has
+/// agreed to receive — sending at the medium maximum overruns any endpoint
+/// sized for the baseline (e.g. libmctp's `MCTP_BTU`, also 64). Until MTU
+/// negotiation exists, fragment at the baseline and let callers opt into more
+/// via [`I2cSender::with_mtu`].
+pub const MCTP_BASELINE_MTU: usize = 64;
+
 /// I2C MCTP sender.
 ///
 /// Implements `mctp_lib::Sender` to fragment and send MCTP packets
@@ -26,6 +36,8 @@ pub struct I2cSender<C: I2c<u8>> {
     // will be implemented later per https://github.com/OpenPRoT/mctp-lib/issues/4.
     // For now, this supports single-peer communication (requester ↔ responder).
     remote_addr: u8,
+    /// Payload bytes per fragment. Defaults to [`MCTP_BASELINE_MTU`].
+    mtu: usize,
 }
 
 impl<C: I2c<u8>> I2cSender<C> {
@@ -39,7 +51,19 @@ impl<C: I2c<u8>> I2cSender<C> {
             i2c,
             own_addr,
             remote_addr,
+            mtu: MCTP_BASELINE_MTU,
         }
+    }
+
+    /// Override the fragmentation MTU.
+    ///
+    /// Only safe above [`MCTP_BASELINE_MTU`] when the peer is known to accept
+    /// larger packets, since nothing here negotiates it. Clamped to
+    /// `MCTP_I2C_MAXMTU` because the send buffers are sized for that.
+    #[must_use]
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu.clamp(1, MCTP_I2C_MAXMTU);
+        self
     }
 }
 
@@ -144,7 +168,7 @@ impl<C: I2c<u8>> mctp_lib::Sender for I2cSender<C> {
     }
 
     fn get_mtu(&self) -> usize {
-        MCTP_I2C_MAXMTU
+        self.mtu
     }
 }
 
@@ -161,7 +185,7 @@ mod tests {
     use i2c_server::loopback::LoopbackTransport;
     use openprot_mctp_server::Server;
 
-    use super::I2cSender;
+    use super::{I2cSender, MCTP_BASELINE_MTU, MCTP_I2C_MAXMTU};
     use crate::MctpI2cReceiver;
 
     // A bus that records every write() payload verbatim. Reads are not needed
@@ -279,5 +303,45 @@ mod tests {
             1,
             "expected exactly one I2C write for a short payload"
         );
+    }
+
+    /// Regression: the sender used to fragment at `MCTP_I2C_MAXMTU` (254),
+    /// which overruns any peer sized for the DSP0236 baseline (libmctp's
+    /// `MCTP_BTU`, 64) and fails on the first large response — GET_CERTIFICATE
+    /// in practice, since everything before it fits in 64 bytes.
+    #[test]
+    fn default_mtu_is_the_dsp0236_baseline() {
+        use mctp_lib::Sender as _;
+        let writes: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+        let addrs: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        let bus = CaptureBus {
+            writes: &writes,
+            addr: &addrs,
+        };
+        let sender = I2cSender::new(I2cClient::new(LoopbackTransport::new(bus)), 0x10, 0x42);
+        assert_eq!(sender.get_mtu(), 64);
+        assert_eq!(MCTP_BASELINE_MTU, 64);
+    }
+
+    #[test]
+    fn with_mtu_overrides_and_clamps_to_medium_max() {
+        use mctp_lib::Sender as _;
+        let writes: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+        let addrs: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        let mk = || {
+            I2cSender::new(
+                I2cClient::new(LoopbackTransport::new(CaptureBus {
+                    writes: &writes,
+                    addr: &addrs,
+                })),
+                0x10,
+                0x42,
+            )
+        };
+        assert_eq!(mk().with_mtu(128).get_mtu(), 128);
+        // Buffers are sized for MCTP_I2C_MAXMTU, so anything above it must clamp
+        // rather than overflow them.
+        assert_eq!(mk().with_mtu(usize::MAX).get_mtu(), MCTP_I2C_MAXMTU);
+        assert_eq!(mk().with_mtu(0).get_mtu(), 1);
     }
 }

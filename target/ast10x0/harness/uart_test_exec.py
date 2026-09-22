@@ -102,12 +102,20 @@ class UartTestExecutor:
             print(message, flush=True)
 
     def print_uart_data(self, data: str):
-        """Print UART data, with detokenized output on the following line in green."""
-        print(data, end="", flush=True)
-        if self.detokenizer:
-            detokenized = self.detokenizer.detokenize_text(data)
-            if detokenized != data:
-                print(f"\033[32m{detokenized}\033[0m", end="", flush=True)
+        """Print UART data. With a detokenizer, print only the decoded form
+        (green) unless --show-raw asks for the token text too."""
+        if not self.detokenizer:
+            print(data, end="", flush=True)
+            return
+
+        detokenized = self.detokenizer.detokenize_text(data)
+        if detokenized == data:
+            print(data, end="", flush=True)
+            return
+
+        if getattr(self.args, "show_raw", False):
+            print(data, end="", flush=True)
+        print(f"\033[32m{detokenized}\033[0m", end="", flush=True)
 
     def run_command(self, cmd: list, check: bool = True) -> Tuple[int, str, str]:
         """Run command and return (returncode, stdout, stderr)."""
@@ -441,7 +449,11 @@ class UartTestExecutor:
             return True
 
         actual_timeout = getattr(self.args, "test_timeout", timeout)
-        self.log(f"Monitoring test execution with {actual_timeout}s timeout...")
+        no_timeout = getattr(self.args, "no_timeout", False)
+        if no_timeout:
+            self.log("Monitoring test execution with no timeout (Ctrl+C to stop)...")
+        else:
+            self.log(f"Monitoring test execution with {actual_timeout}s timeout...")
 
         if self.args.dry_run:
             self.log("DRY RUN: Would monitor test execution")
@@ -451,36 +463,42 @@ class UartTestExecutor:
         buffer = ""
         test_results = {"passed": 0, "failed": 0, "skipped": 0}
 
-        while time.time() - start_time < actual_timeout:
-            data = self.read_serial_data(0.5)
-            if data:
-                buffer += data
-                if not self.args.quiet:
-                    self.print_uart_data(data)
+        try:
+            while no_timeout or time.time() - start_time < actual_timeout:
+                data = self.read_serial_data(0.5)
+                if data:
+                    buffer += data
+                    if not self.args.quiet:
+                        self.print_uart_data(data)
 
-                lines = buffer.split("\n")
-                for line in lines:
-                    if "PASS" in line:
-                        test_results["passed"] += 1
-                    elif "FAIL" in line:
-                        test_results["failed"] += 1
-                    elif "SKIP" in line:
-                        test_results["skipped"] += 1
+                    lines = buffer.split("\n")
+                    for line in lines:
+                        if "PASS" in line:
+                            test_results["passed"] += 1
+                        elif "FAIL" in line:
+                            test_results["failed"] += 1
+                        elif "SKIP" in line:
+                            test_results["skipped"] += 1
 
-                    # Check for completion
-                    for pattern in self.SUCCESS_PATTERNS:
-                        if pattern in line:
-                            self.log(f"\nTest execution completed!")
-                            self.log(f"Results: {test_results}")
-                            return test_results["failed"] == 0
+                        # Check for completion
+                        for pattern in self.SUCCESS_PATTERNS:
+                            if pattern in line:
+                                self.log(f"\nTest execution completed!")
+                                self.log(f"Results: {test_results}")
+                                return test_results["failed"] == 0
 
-                    # Check for failure
-                    for pattern in self.FAILURE_PATTERNS:
-                        if pattern.lower() in line.lower():
-                            self.log(f"\nFailure detected: {pattern}")
-                            return False
+                        # Check for failure
+                        for pattern in self.FAILURE_PATTERNS:
+                            if pattern.lower() in line.lower():
+                                self.log(f"\nFailure detected: {pattern}")
+                                return False
 
-                buffer = "\n".join(lines[-10:])
+                    buffer = "\n".join(lines[-10:])
+        except KeyboardInterrupt:
+            # Ctrl+C is the expected exit from --no-timeout, so report the tally
+            # before the top-level handler turns this into exit 130.
+            self.log(f"\nStopped by user. Results so far: {test_results}")
+            raise
 
         self.log(f"\nTest monitoring timeout. Results so far: {test_results}")
         return test_results["failed"] == 0
@@ -540,6 +558,9 @@ Examples:
 
   # Don't wait for 'U' -- start the upload the moment the port is open
   ./uart_test_exec.py --skip-gpio --force /dev/ttyUSB0 firmware.bin
+
+  # Watch the UART indefinitely; Ctrl+C to stop
+  ./uart_test_exec.py --no-timeout /dev/ttyUSB0 firmware.bin
         """,
     )
 
@@ -549,6 +570,12 @@ Examples:
     )
     parser.add_argument("firmware", nargs="?", help="Firmware binary file path")
     parser.add_argument("--elf", help="ELF file for pw_tokenizer detokenization")
+    parser.add_argument(
+        "--show-raw",
+        action="store_true",
+        help="With --elf, also print the raw tokenized text alongside the "
+        "decoded output (default: decoded only)",
+    )
 
     # GPIO control
     parser.add_argument(
@@ -593,6 +620,12 @@ Examples:
         type=int,
         default=600,
         help="Test execution monitoring timeout in seconds (default: 600)",
+    )
+    parser.add_argument(
+        "--no-timeout",
+        action="store_true",
+        help="Ignore --test-timeout and monitor UART until Ctrl+C "
+        "(a success/failure pattern still ends the run)",
     )
     parser.add_argument(
         "--log-file", help="Log file path (auto-generated if not specified)"

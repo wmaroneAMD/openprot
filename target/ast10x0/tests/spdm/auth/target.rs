@@ -11,7 +11,7 @@ use console_backend::console_backend_write_all;
 use entry as _;
 use target_common::{declare_target, TargetInterface};
 
-const I2C2_CFG: I2cConfig = I2cConfig {
+const I2C_BUS_CFG: I2cConfig = I2cConfig {
     speed: I2cSpeed::Standard,
     xfer_mode: I2cXferMode::DmaMode,
     multi_master: false,
@@ -20,11 +20,26 @@ const I2C2_CFG: I2cConfig = I2cConfig {
     clock_config: ClockConfig::ast1060_default(),
 };
 
-static PINCTRL_GROUPS: [&[ast10x0_peripherals::scu::PinctrlPin]; 1] = [pinctrl::PINCTRL_I2C2];
-static I2C_BUSES: [I2cBusCfg; 1] = [I2cBusCfg {
-    bus: 2,
-    config: I2C2_CFG,
-}];
+// This source is compiled into two kernel binaries — `:target` (requester,
+// codegen from system.json5) and `:target_peer` (responder, codegen from
+// peer_system.json5) — so it brings up every bus either image may open:
+//   bus 2 (SCL3/SDA3, GPIOI0/I1)  — requester, harness J15 daughter-to-daughter
+//   bus 8 (SCL9/SDA9, GPIOJ4/J5)  — responder, routes to the parent AST2600's
+//                                   SCL1/SDA1 (B20/A20) = BMC /dev/i2c-0
+// Each app opens only its own bus; the unused controller sits idle. The IRQ
+// binding is what actually differs, and that comes from each kernel's codegen.
+static PINCTRL_GROUPS: [&[ast10x0_peripherals::scu::PinctrlPin]; 2] =
+    [pinctrl::PINCTRL_I2C2, pinctrl::PINCTRL_I2C8];
+static I2C_BUSES: [I2cBusCfg; 2] = [
+    I2cBusCfg {
+        bus: 2,
+        config: I2C_BUS_CFG,
+    },
+    I2cBusCfg {
+        bus: 8,
+        config: I2C_BUS_CFG,
+    },
+];
 
 pub struct Target;
 

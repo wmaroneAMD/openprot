@@ -25,23 +25,23 @@ static mut SLAVE_DMA_BUF: [u8; 256] = [0u8; 256];
 
 #[entry]
 fn entry() {
-    // SAFETY: board init ran init_bus(2) in the kernel; buffers are non-cached and owned here.
+    // SAFETY: board init ran init_bus(8) in the kernel; buffers are non-cached and owned here.
     let master_dma_buf: &'static mut [u8] =
         unsafe { &mut *core::ptr::addr_of_mut!(MASTER_DMA_BUF) };
     let slave_dma_buf: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(SLAVE_DMA_BUF) };
     let driver =
-        match unsafe { i2c_backend::open_bus_dma(2, &SLAVE_CFG, master_dma_buf, slave_dma_buf) } {
+        match unsafe { i2c_backend::open_bus_dma(8, &SLAVE_CFG, master_dma_buf, slave_dma_buf) } {
             Ok(d) => d,
             Err(_) => {
-                pw_log::error!("open_bus_dma(2) failed");
+                pw_log::error!("open_bus_dma(8) failed");
                 loop {}
             }
         };
 
-    pw_log::info!("I2C server peer ready on Bus 2");
+    pw_log::info!("I2C server peer ready on Bus 8");
 
-    let mut buses = [Bus::new(handle::I2C, handle::I2C2_IRQ, driver)];
-    run(handle::WG, signals::I2C2, &mut buses);
+    let mut buses = [Bus::new(handle::I2C, handle::I2C8_IRQ, driver)];
+    run(handle::WG, signals::I2C8, &mut buses);
 }
 
 #[panic_handler]
