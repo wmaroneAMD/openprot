@@ -20,6 +20,7 @@
 * [Services](./specification/services/README.md)
   * [Attestation](./specification/services/attestation.md)
   * [Firmware Update](./specification/services/fwupdate.md)
+  * [Boot Logging](./specification/services/bootlog.md)
 * [Device Abstraction](./specification/device_abstraction/README.md)
 * [Terminology](./specification/terminology.md)
 
