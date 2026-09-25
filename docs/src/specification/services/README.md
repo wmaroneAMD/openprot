@@ -10,6 +10,7 @@ The following services are defined in the OpenPRoT specification:
 
 *   [Firmware Update](./fwupdate.md)
 *   [Attestation](./attestation.md)
+*   [Boot Logging](./bootlog.md)
 *   Firmware Recovery (TBD)
 *   Secure Boot (TBD)
 *   Policy Management (TBD)
