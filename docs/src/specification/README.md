@@ -150,6 +150,8 @@ The OpenPRoT architecture can be broken down into the following layers:
         components.
     *   [Firmware Update & Recovery](./services/fwupdate.md): Orchestrates the
         secure update and recovery of firmware for platform components.
+    *   [Boot Logging](./services/bootlog.md): Collects unauthenticated boot
+        progress reports from platform components during early boot.
     *   **Telemetry:** Collects and extracts telemetry data.
 5.  **Applications:** At the highest level are the applications that implement
     the core logic of the PRoT. These applications have room for differentiation

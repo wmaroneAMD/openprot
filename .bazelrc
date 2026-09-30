@@ -21,6 +21,9 @@ common --incompatible_default_to_explicit_init_py
 # our toolchains, and CI VMs may not have any local toolchain to detect.
 common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
 
+# Avoid issues with intercepting proxies 
+common --repo_env=CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 test --@pigweed//pw_kernel:enable_tests=true
 test --platform_suffix=test
 

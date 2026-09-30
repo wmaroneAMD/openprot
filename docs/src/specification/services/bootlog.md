@@ -27,8 +27,31 @@ access control decision.
 
 ## Transport
 
-Messages are carried over MCTP, to disconnect boot logging from the underlying
-wire trnasport.
+Messages are carried over MCTP 1.3.1 (DSP0236), to disconnect boot logging from
+the underlying wire transport. In early boot the binding is normally MCTP over
+SMBus/I2C 1.2.0 (DSP0237), the binding required by the OpenPRoT
+[MCTP](../middleware/mctp.md) specification.
+
+### Addressing
+
+A sender in early boot has no EID: EID assignment needs a bus owner, discovery,
+and a sender able to answer control messages, none of which it has. Boot status
+messages are therefore physically addressed.
+
+* The destination EID is the null EID, `0x00`. DSP0236 defines this to mean the
+  EID is ignored and only physical addressing routes the message, which is what
+  lets a device reach the PRoT without knowing its EID.
+* The source EID is likewise the null EID.
+* The physical address is the PRoT's own, a board constant the sender needs to
+  drive the bus at all.
+* The broadcast EID `0xFF` shall not be used. DSP0236 reserves it for MCTP
+  control messages on a single bus, and the SMBus/I2C binding provides no
+  broadcast address for MCTP traffic, so it would not spare a sender from
+  knowing a physical address.
+
+Because every sender shares the null source EID, a receiver shall take the
+sender's identity from the message payload and shall not rely on the source EID
+to tell devices apart.
 
 ### MCTP Rules
 
@@ -36,9 +59,14 @@ wire trnasport.
 * A boot status message shall fit in a single MCTP baseline transmission unit
   (64 bytes), so no message needs reassembly.
 * Every message sets both SOM and EOM. A device shall send exactly one boot
-  status message per MCTP message.
+  status message per MCTP message. This also keeps senders that share the null
+  source EID from colliding: a single-packet message completes on arrival, so
+  there is no reassembly state for a second sender to disturb.
 * Senders do not wait for, and do not receive, a response.
-* A sender whose transmit is delayed by bus contention or intenrnal timing 
+* A sender sets the Tag Owner (TO) bit. Receivers dispatch boot status to a
+  listener only when the sender owns the tag; a message sent with TO clear looks
+  like a response to a request nobody made and is discarded.
+* A sender whose transmit is delayed by bus contention or internal timing
   should buffer pending boot status messages and send when possible.
 * If a buffer should roll over, buffered entries tagged as a vendor boot
   message may be discarded. All others must be preserved and sent when possible.
@@ -64,8 +92,8 @@ Byte  9 > |                        Timestamp (microseconds)                     
           +-----------------+-----------------+-----------------+-----------------+
 Byte 13 > |             Device ID             |         OpenPRoT Boot Code        |
           +-----------------+-----------------+-----------------+-----------------+
-Byte 17 > |          Vendor Boot Code         |
-          +-----------------+-----------------+
+Byte 17 > |          Vendor Boot Code         |              Reserved             |
+          +-----------------+-----------------+-----------------+-----------------+
 ```
 
 `I` is the MCTP integrity check bit (IC), always 0b for boot status messages.
@@ -81,8 +109,12 @@ Byte 17 > |          Vendor Boot Code         |
 | 12 | 2 | Device ID (vendor assigned) |
 | 14 | 2 | OpenPRoT boot code |
 | 16 | 2 | Vendor boot code |
+| 18 | 2 | Reserved |
 
-Total payload is 18 bytes.
+Total payload is 20 bytes, padded to a dword boundary. Senders shall set the
+reserved bytes to zero; receivers shall ignore them. A later revision that needs
+more space claims it by incrementing the format revision, so a receiver knows
+from byte 2 which layout it is reading.
 
 *   **Vendor ID**, **Device ID**, and **Device instance** identify the sender.
     They are carried in the payload because an EID may not yet be assigned.
@@ -130,13 +162,13 @@ Defined codes (TBD, to be expanded):
 | `0x0004` | Transport OK | Boot logging transport is online and functional. |
 | `0x0005` | Mutable stage entered | The device has left ROM and is executing updatable firmware. |
 | `0x1000` | Vendor boot log entry | The event has no common meaning; the vendor boot code carries it. |
-| `0x7fff` | Boot complete | The device has finished booting and is operational. |
+| `0x7FFF` | Boot complete | The device has finished booting and is operational. |
 
 ### Errors
 
 An error code is its corresponding stage code with bit 15 set, so a receiver
 translates between the two by flipping one bit. Stages `0x0001`, `0x0005` and
-`0x7fff` are progress markers with no failure counterpart; a device that never
+`0x7FFF` are progress markers with no failure counterpart; a device that never
 reaches them reports `0x8000`. A vendor-specific failure is `0x9000`, the
 counterpart of `0x1000`.
 
