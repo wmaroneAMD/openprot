@@ -1,19 +1,37 @@
 # Boot Log Receiver Hardware Test
 
-One AST1060 EVB runs the boot log receiver. Boot status messages are pushed
-onto I2C bus 2 by an external master - there is no second board and no sender
-firmware yet, so the frames are written by hand.
+Two AST1060 EVBs wired together on I2C bus 2. One runs the boot log receiver;
+the other pushes sample boot status messages at it. The pusher stands in for a
+real reporting device until the OpenPRoT sender exists.
 
 The receiver decodes each message, records it in a per-device log, and prints
-what it said. Success is a matching log line per frame pushed.
+what it said. Success is a matching log line per message pushed.
 
-## Apps
+Messages can also be pushed by any other I2C master - see
+[Pushing frames by hand](#pushing-frames-by-hand).
+
+## Images
+
+`bootlog_image` (board A, the PRoT):
 
 | App | Role |
 |:----|:-----|
 | `i2c_server` | owns I2C bus 2, slave address `0x10` |
 | `mctp_server` | I2C transport binding, MCTP channel handler, EID 8 |
 | `bootlog_receiver` | listens on MCTP message type `0x5A` |
+
+`bootlog_push_image` (board B, the dummy sender):
+
+| App | Role |
+|:----|:-----|
+| `i2c_server_push` | owns I2C bus 2, address `0x42` |
+| `bootlog_push` | masters the bus and pushes the sample messages |
+
+The pusher reuses `Sender<T>` from `//services/bootlog` over a small
+`BootLogTransport` that wraps each message in an MCTP-over-SMBus frame, so the
+bytes on the wire are built the same way a real sender would build them. It
+loops: four messages 500ms apart, then a 5s gap, restarting each device's
+sequence counter every round.
 
 ## Running
 
@@ -25,10 +43,24 @@ bazel test \
     -- //target/ast10x0/tests/bootlog:bootlog_receiver_test
 ```
 
-Fixture setup (Pi wiring, SSH keys, lockfile behavior) is identical to the MCTP
-server test; see [that README](../mctp/server/README.md).
+One command flashes both boards. The test target carries `bootlog_image` as its
+own binary and `bootlog_push_image` as `slave_image`; the runner picks the
+second up automatically from the `.slave.elf` symlink beside the first:
 
-Expected output once frames start arriving:
+| Board | Image | `evb_config.toml` |
+|:------|:------|:------------------|
+| A | `bootlog_image` (receiver) | `[uart]`, `/dev/ttyUSB0` |
+| B | `bootlog_push_image` (sender) | `[device_b]`, `/dev/ttyUSB1` |
+
+Both UART streams are spliced into the same output, so board A's received lines
+and board B's pushed lines interleave.
+
+There is no PASS/FAIL sentinel - the receiver loops forever - so the test runs
+until `Ctrl-C` or the `eternal` timeout. Fixture setup (Pi wiring, SSH keys,
+lockfile behavior) is identical to the MCTP server test; see
+[that README](../mctp/server/README.md).
+
+Expected output from board A once messages start arriving:
 
 ```
 boot log receiver starting
@@ -39,11 +71,15 @@ vendor=0x00001234 device=0x0001.0 seq=2 t=9000us code=0x8003 vendor_code=0x00f1
 vendor=0x00001234 device=0x0002.1 seq=0 t=2000us code=0x7fff vendor_code=0x0099
 ```
 
-Those four lines correspond to the four sample frames below, in order. Anything
-that is not boot status - wrong message type, integrity check bit set, payload
-too short - is logged as an error and discarded rather than recorded.
+Those four lines are one push round. Board B logs a matching `pushed ...` line
+for each. Anything that is not boot status - wrong message type, integrity check
+bit set, payload too short - is logged as an error and discarded rather than
+recorded.
 
-## Sample frames
+## Pushing frames by hand
+
+The same messages as raw frames, for pushing from a bench master instead of
+board B.
 
 Complete SMBus block writes to slave address `0x10`, including the destination
 address byte and the trailing PEC. Source address is `0x42`, both EIDs are null,
@@ -82,9 +118,9 @@ C8      SOM | EOM | TO, packet sequence 0, tag 0
 A8      PEC, CRC-8 over every preceding byte
 ```
 
-### Pushing them
+### From a Linux master
 
-From a Linux master on the same bus, where `$BUS` is the adapter number:
+Where `$BUS` is the adapter number:
 
 ```bash
 # device A, ROM entered
