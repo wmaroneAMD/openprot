@@ -14,6 +14,12 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+filegroup(
+    name = "push_system_config",
+    srcs = ["push_system.json5"],
+    visibility = ["//visibility:public"],
+)
+
 target_codegen(
     name = "codegen",
     arch = "@pigweed//pw_kernel/arch/arm_cortex_m:arch_arm_cortex_m",
@@ -110,6 +116,43 @@ rust_app(
     ],
 )
 
+rust_app(
+    name = "i2c_server_push",
+    srcs = ["i2c_server_main_push.rs"],
+    codegen_crate_name = "app_i2c_server_push",
+    edition = "2024",
+    system_config = ":push_system_config",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        "//services/i2c/server-runtime:i2c_server_runtime",
+        "//target/ast10x0/backend/i2c:i2c_backend_ast10x0",
+        "//target/ast10x0/peripherals",
+        "@pigweed//pw_kernel/userspace",
+        "@pigweed//pw_log/rust:pw_log",
+    ],
+)
+
+rust_app(
+    name = "bootlog_push",
+    srcs = ["bootlog_push_main.rs"],
+    codegen_crate_name = "app_bootlog_push",
+    edition = "2024",
+    system_config = ":push_system_config",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        "//services/bootlog",
+        "//services/i2c/client:i2c_client",
+        "//services/i2c/client-ipc:i2c_client_ipc",
+        "@pigweed//pw_kernel/syscall:syscall_user",
+        "@pigweed//pw_kernel/userspace",
+        "@pigweed//pw_log/rust:pw_log",
+        "@rust_crates//:embedded-hal",
+        "@rust_crates//:mctp-lib",
+    ],
+)
+
 system_image(
     name = "bootlog_image",
     apps = [
@@ -125,10 +168,25 @@ system_image(
     visibility = ["//visibility:public"],
 )
 
+system_image(
+    name = "bootlog_push_image",
+    apps = [
+        ":i2c_server_push",
+        ":bootlog_push",
+    ],
+    kernel = ":target",
+    platform = "//target/ast10x0",
+    system_config = ":push_system_config",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    visibility = ["//visibility:public"],
+)
+
 system_image_test(
     name = "bootlog_receiver_test",
     timeout = "eternal",
     image = ":bootlog_image",
+    slave_image = ":bootlog_push_image",
     tags = [
         "hardware",
         "manual",

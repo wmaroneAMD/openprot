@@ -1,0 +1,89 @@
+// Licensed under the Apache-2.0 license
+// SPDX-License-Identifier: Apache-2.0
+
+// AST10x0 Boot Log Dummy Sender Configuration (push image)
+//
+// Runs on the second board:
+// - i2c_server_push: owns i2c hardware and runs i2c_server_runtime
+// - bootlog_push: masters the bus and pushes sample boot status messages
+{
+    arch: {
+        type: "armv7m",
+        vector_table_start_address: 0x00000000,
+        vector_table_size_bytes: 1792,
+    },
+    kernel: {
+        flash_start_address: 0x00000700,
+        flash_size_bytes: 129280,
+        ram_start_address: 0x00060000,
+        ram_size_bytes: 131072,
+    },
+    apps: [
+        {
+            name: "i2c_server_push",
+            flash_size_bytes: 65536,
+            processes: [
+                {
+                    name: "i2c_server_push_process",
+                    ram_size_bytes: 65536,
+                    objects: [
+                        {
+                            name: "wg",
+                            type: "wait_group",
+                        },
+                        {
+                            name: "i2c",
+                            type: "channel_handler",
+                        },
+                        {
+                            name: "i2c2_irq",
+                            type: "interrupt",
+                            irqs: [
+                                {
+                                    name: "i2c2",
+                                    number: 112,
+                                },
+                            ],
+                        },
+                        {
+                            type: "thread",
+                            name: "i2c_server_push_thread",
+                            kernel_stack_size_bytes: 4096,
+                        },
+                    ],
+                    memory_mappings: [
+                        {
+                            name: "i2c_regs",
+                            type: "device",
+                            start_address: 0x7e7b0000,
+                            size_bytes: 0x4000,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            name: "bootlog_push",
+            flash_size_bytes: 65536,
+            processes: [
+                {
+                    name: "bootlog_push_process",
+                    ram_size_bytes: 65536,
+                    objects: [
+                        {
+                            name: "i2c",
+                            type: "channel_initiator",
+                            handler_process: "i2c_server_push_process",
+                            handler_object_name: "i2c",
+                        },
+                        {
+                            type: "thread",
+                            name: "bootlog_push_thread",
+                            kernel_stack_size_bytes: 4096,
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}
