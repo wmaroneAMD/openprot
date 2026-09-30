@@ -14,6 +14,7 @@ The following acronyms and abbreviations are used throughout this document.
 | DICE | Device Identifier Composition Engine |
 | DRBG | Deterministic Random Bit Generator |
 | ECDSA | Elliptic Curve Digital Signature Algorithm |
+| EID | Endpoint ID |
 | FMC | FW First Measured Code |
 | GPU | Graphics Processing Unit |
 | HMAC | Hash-based message authentication code |
@@ -28,6 +29,7 @@ The following acronyms and abbreviations are used throughout this document.
 | OCP | Open Compute Project |
 | OTP | One-time programmable |
 | PCR | Platform Configuration Register |
+| PEN | Private Enterprise Number |
 | PKI | Public Key infrastructure |
 | PLDM | Platform Level Data Model |
 | PUF | Physically unclonable function |
