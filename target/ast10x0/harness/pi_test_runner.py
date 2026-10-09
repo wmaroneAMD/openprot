@@ -83,25 +83,52 @@ _SUCCESS_SENTINEL = b"TEST_RESULT:PASS"
 _FAILURE_SENTINELS = [b"TEST_RESULT:FAIL", b"panic"]
 
 
-def _stream_uart(port: serial.Serial, lock=None) -> bool:
+def _emit(lock, prefix: bytes, line: bytes) -> bool:
+    """Write one tagged line. Returns False if the pipe is gone."""
+    try:
+        with lock or nullcontext():
+            sys.stdout.buffer.write(prefix + line)
+            sys.stdout.buffer.flush()
+    except (BrokenPipeError, OSError):
+        return False
+    return True
+
+
+def _stream_uart(port: serial.Serial, lock=None, tag: str = "A") -> bool:
+    """Stream one port to stdout, one whole line per write.
+
+    Both boards share stdout, so a partial write from one would land inside the
+    other's line and corrupt it — fatally for tokenized log messages, which the
+    host cannot decode once split. Lines are buffered here and emitted whole,
+    each prefixed with SOH and a board tag the host uses to separate them.
+    """
     port.timeout = 1.0
+    prefix = b"\x01" + tag.encode()
     buf = b""
+    line = b""
     while True:
         data = port.read(1024)
-        if data:
-            try:
-                with lock or nullcontext():
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
-            except (BrokenPipeError, OSError):
-                return False
-            buf += data
-            if _SUCCESS_SENTINEL in buf:
-                return True
-            for s in _FAILURE_SENTINELS:
-                if s in buf:
+        if not data:
+            # Idle: flush a line the board left unterminated rather than hold it.
+            if line:
+                if not _emit(lock, prefix, line + b"\n"):
                     return False
-            buf = buf[-256:]
+                line = b""
+            continue
+
+        line += data
+        while b"\n" in line:
+            one, line = line.split(b"\n", 1)
+            if not _emit(lock, prefix, one + b"\n"):
+                return False
+
+        buf += data
+        if _SUCCESS_SENTINEL in buf:
+            return True
+        for s in _FAILURE_SENTINELS:
+            if s in buf:
+                return False
+        buf = buf[-256:]
 
 
 def _run_paired(args, firmware_path: Path, slave_firmware_path: Path) -> bool:
@@ -141,12 +168,12 @@ def _run_paired(args, firmware_path: Path, slave_firmware_path: Path) -> bool:
 
         results = [None, None]
 
-        def _monitor(idx, port):
-            results[idx] = _stream_uart(port, _stdout_lock)
+        def _monitor(idx, port, tag):
+            results[idx] = _stream_uart(port, _stdout_lock, tag)
 
         threads = [
-            threading.Thread(target=_monitor, args=(0, port_a)),
-            threading.Thread(target=_monitor, args=(1, port_b)),
+            threading.Thread(target=_monitor, args=(0, port_a, "A")),
+            threading.Thread(target=_monitor, args=(1, port_b, "B")),
         ]
         for t in threads:
             t.start()

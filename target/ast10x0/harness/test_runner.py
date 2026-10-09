@@ -66,6 +66,9 @@ except ImportError:
 # thread so the stale-lock detector knows we're still alive.
 
 _LOCK_PATH = "/tmp/ast1060_evb.lock"
+
+# Bracketed first letter so the pattern does not match the shell running it.
+_KILL_RUNNER = "pkill -f '[p]i_test_runner.py' || true"
 _LOCK_TOUCH_INTERVAL = 10  # seconds between lock touches
 _LOCK_STALE_THRESHOLD = 60  # seconds since last touch → lock is stale
 _LOCK_ACQUIRE_TIMEOUT = 120  # seconds to wait before giving up
@@ -102,11 +105,14 @@ def _acquire_lock(host: str, timeout: int = _LOCK_ACQUIRE_TIMEOUT) -> bool:
         f"printf '%s\\t%s\\n' '{local_user}' \"$(date +%s)\" > {_LOCK_PATH} || "
         f"{{ cat {_LOCK_PATH} 2>/dev/null; false; }}"
     )
+    # A stale lock means the holder is gone or wedged, but its runner may still
+    # be alive and holding the serial ports — which looks to the next run like a
+    # board that never reaches the bootloader. Clear both.
     stale_check = (
         f"mtime=$(stat -c %Y {_LOCK_PATH} 2>/dev/null) && "
         f"now=$(date +%s) && "
         f"[ $(( now - mtime )) -gt {_LOCK_STALE_THRESHOLD} ] && "
-        f"rm -f {_LOCK_PATH}"
+        f"{{ {_KILL_RUNNER}; rm -f {_LOCK_PATH}; }}"
     )
     last_printed = 0.0
     while time.time() < deadline:
@@ -151,6 +157,16 @@ def _acquire_lock(host: str, timeout: int = _LOCK_ACQUIRE_TIMEOUT) -> bool:
     return False
 
 
+def _kill_remote_runner(host: str) -> None:
+    """Kill any pi_test_runner.py on the Pi so it lets go of the serial ports.
+
+    Terminating the local ssh does not reach the remote process — there is no
+    tty for the hangup to travel down — so a run that ends any way other than
+    the runner exiting on its own leaves it holding both UARTs.
+    """
+    _ssh(host, _KILL_RUNNER, capture_output=True)
+
+
 def _release_lock(host: str) -> None:
     _ssh(host, f"rm -f {_LOCK_PATH}", capture_output=True)
 
@@ -182,62 +198,103 @@ def _touch_lock_forever(host: str, stop: threading.Event) -> None:
 class UartMonitor:
     """Detokenizes and displays raw UART bytes. Pass/fail is determined by pi_test_runner.py exit code."""
 
-    def __init__(self, args: argparse.Namespace, *elf_paths: Path) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *elf_paths: Path,
+        board_logs: dict[str, Path] | None = None,
+    ) -> None:
         self.args = args
         self.log_file_handle = open(args.log_file, "w") if args.log_file else None
         elf_args = [str(p) for p in elf_paths if p is not None]
         self.detokenizer = (
             Detokenizer(*elf_args) if _PW_TOKENIZER_AVAILABLE and elf_args else None
         )
-        self._token_parser = NestedMessageParser() if _PW_TOKENIZER_AVAILABLE else None
+        # One parser per board: it keeps state across calls, so a single shared
+        # parser lets an unterminated token from one board be completed by the
+        # next line from the other, printing that board's message in the wrong
+        # stream.
+        self._token_parsers: dict[str, object] = {}
+        # Per-board log files, keyed by the tag pi_test_runner.py prefixes each
+        # line with. Opened lazily so a board that never speaks leaves no file.
+        self._board_log_paths = board_logs or {}
+        self._board_log_handles: dict[str, object] = {}
+        self._pending = b""
 
     def _write_log(self, text: str) -> None:
         if self.log_file_handle:
             self.log_file_handle.write(text)
             self.log_file_handle.flush()
 
-    def print_uart_data(self, raw: bytes) -> None:
-        """Detokenize raw UART bytes and print them.
-
-        pw_tokenizer embeds $<base64> token frames in the byte stream.
-        NestedMessageParser preserves state across calls so tokens split
-        across successive reads are reassembled correctly.
-        """
-        if self.detokenizer and self._token_parser:
-            for is_token, span in self._token_parser.read_messages(raw):
-                if not is_token:
-                    text = span.decode("utf-8", errors="replace")
-                    os.write(1, text.encode("utf-8", errors="replace"))
-                    self._write_log(text)
-                    continue
-
-                # span is b'$<base64chars>' — strip '$' and add padding.
-                raw_text = span.decode("utf-8", errors="replace")
-                try:
-                    b64 = span[1:]
-                    b64 += b"=" * (-len(b64) % 4)
-                    encoded = base64.b64decode(b64, validate=True)
-                    result = self.detokenizer.detokenize(encoded)
-                except (binascii.Error, ValueError):
-                    result = None
-
-                if result is not None and result.ok():
-                    decoded_str = str(result)
-                    os.write(
-                        1,
-                        f"\033[32m{decoded_str}\033[0m".encode(
-                            "utf-8", errors="replace"
-                        ),
-                    )
-                    self._write_log(decoded_str)
-                else:
-                    os.write(1, raw_text.encode("utf-8", errors="replace"))
-                    self._write_log(raw_text)
+    def _write_board_log(self, tag: str, text: str) -> None:
+        path = self._board_log_paths.get(tag)
+        if path is None:
             return
+        handle = self._board_log_handles.get(tag)
+        if handle is None:
+            handle = open(path, "w")
+            self._board_log_handles[tag] = handle
+        handle.write(text)
+        handle.flush()
 
-        text = raw.decode("utf-8", errors="replace")
-        os.write(1, text.encode("utf-8", errors="replace"))
-        self._write_log(text)
+    def _render(self, raw: bytes, tag: str) -> str:
+        """Detokenize one line, returning text with tokens replaced."""
+        if not (self.detokenizer and _PW_TOKENIZER_AVAILABLE):
+            return raw.decode("utf-8", errors="replace")
+
+        parser = self._token_parsers.get(tag)
+        if parser is None:
+            parser = NestedMessageParser()
+            self._token_parsers[tag] = parser
+
+        out = []
+        for is_token, span in parser.read_messages(raw):
+            if not is_token:
+                out.append(span.decode("utf-8", errors="replace"))
+                continue
+
+            # span is b'$<base64chars>' — strip '$' and add padding.
+            try:
+                b64 = span[1:]
+                b64 += b"=" * (-len(b64) % 4)
+                result = self.detokenizer.detokenize(
+                    base64.b64decode(b64, validate=True)
+                )
+            except (binascii.Error, ValueError):
+                result = None
+
+            if result is not None and result.ok():
+                out.append(f"\033[32m{result}\033[0m")
+            else:
+                out.append(span.decode("utf-8", errors="replace"))
+        return "".join(out)
+
+    def _handle_line(self, line: bytes) -> None:
+        """Route one line: SOH + tag identifies the board that sent it."""
+        tag = ""
+        if line.startswith(b"\x01") and len(line) >= 2:
+            tag = line[1:2].decode("ascii", errors="replace")
+            line = line[2:]
+
+        text = self._render(line, tag)
+        label = f"{tag}| " if tag else ""
+        os.write(1, f"{label}{text}\n".encode("utf-8", errors="replace"))
+        self._write_log(f"{label}{text}\n")
+        if tag:
+            # Board logs hold that board's output alone, without the label.
+            self._write_board_log(tag, f"{text}\n")
+
+    def print_uart_data(self, raw: bytes) -> None:
+        """Buffer raw bytes and process them a line at a time.
+
+        pi_test_runner.py emits one whole line per write, tagged with the board
+        it came from, so lines arrive intact even with two boards sharing the
+        stream. Chunk boundaries still fall mid-line, hence the buffer.
+        """
+        self._pending += raw
+        while b"\n" in self._pending:
+            line, self._pending = self._pending.split(b"\n", 1)
+            self._handle_line(line)
 
     def display_stream(self, pipe) -> None:
         """Read raw bytes from pipe and detokenize for display until EOF."""
@@ -248,9 +305,15 @@ class UartMonitor:
             self.print_uart_data(chunk)
 
     def cleanup(self) -> None:
+        if self._pending:
+            self._handle_line(self._pending)
+            self._pending = b""
         if self.log_file_handle:
             self.log_file_handle.close()
             self.log_file_handle = None
+        for handle in self._board_log_handles.values():
+            handle.close()
+        self._board_log_handles.clear()
 
 
 # ── Local execution ───────────────────────────────────────────────────────────
@@ -348,10 +411,32 @@ def _run_remote(
         )
 
     proc = _ssh_stream(host, remote_cmd)
+
+    # --duration bounds a test that would otherwise run until Bazel's test
+    # timeout. Reaching it is a failure: the test had that long to reach a
+    # result and did not.
+    expired = threading.Event()
+    duration_timer = None
+    if args.duration:
+        def _expire() -> None:
+            expired.set()
+            print(
+                f"RUNNER: {args.duration}s duration reached with no result, "
+                "failing test",
+                file=sys.stderr,
+            )
+            proc.terminate()
+
+        duration_timer = threading.Timer(args.duration, _expire)
+        duration_timer.daemon = True
+        duration_timer.start()
+
     try:
         monitor.display_stream(proc.stdout)
         proc.wait()
     finally:
+        if duration_timer:
+            duration_timer.cancel()
         if proc.returncode is None:
             proc.terminate()
             try:
@@ -363,7 +448,7 @@ def _run_remote(
         stop_touch.set()
         _release_lock(host)
 
-    return proc.returncode == 0
+    return proc.returncode == 0 and not expired.is_set()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -398,6 +483,25 @@ def main() -> int:
     parser.add_argument(
         "--log-file",
         help="Write detokenized UART output to this file",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=None,
+        help=(
+            "Fail the test if it has not reached a result within this many "
+            "seconds. Bounds a run that would otherwise sit until the Bazel "
+            "test timeout"
+        ),
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help=(
+            "Directory for per-board UART logs, one file per board named "
+            "<image>_<board>_<device>_<timestamp>.log. Defaults to "
+            "$TEST_UNDECLARED_OUTPUTS_DIR, else the current directory"
+        ),
     )
     parser.add_argument(
         "-q",
@@ -452,7 +556,25 @@ def main() -> int:
     args.pi_host = os.environ.get(AST1060_EVB_PI_HOST) or args.pi_host
 
     runner = Path(__file__).parent / "pi_test_runner.py"
-    monitor = UartMonitor(args, elf_path, slave_elf_path)
+
+    log_dir = Path(
+        args.log_dir or os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR") or "."
+    )
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def _board_log(image: Path, board: str, device: str) -> Path:
+        return log_dir / f"{image.stem}_{board}_{Path(device).name}_{stamp}.log"
+
+    board_logs = {"A": _board_log(elf_path, "A", uart_device)}
+    if slave_elf_path is not None:
+        board_logs["B"] = _board_log(
+            slave_elf_path, "B", config["device_b"]["serial_port"]
+        )
+    for board, path in board_logs.items():
+        print(f"RUNNER: board {board} log -> {path}", file=sys.stderr)
+
+    monitor = UartMonitor(args, elf_path, slave_elf_path, board_logs=board_logs)
 
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(130))
 

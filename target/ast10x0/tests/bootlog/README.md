@@ -27,11 +27,34 @@ Messages can also be pushed by any other I2C master - see
 | `i2c_server_push` | owns I2C bus 2, address `0x42` |
 | `bootlog_push` | masters the bus and pushes the sample messages |
 
+Each image builds its own kernel (`:target` and `:push_target`). The kernel's
+object table is generated from the system config it was built against, so an
+image whose apps do not match that table gets handles pointing at the wrong
+objects - every IPC call then fails. Two-board tests that share one kernel get
+away with it only because both of their configs have the same shape.
+
 The pusher reuses `Sender<T>` from `//services/bootlog` over a small
 `BootLogTransport` that wraps each message in an MCTP-over-SMBus frame, so the
 bytes on the wire are built the same way a real sender would build them. It
-loops: four messages 500ms apart, then a 5s gap, restarting each device's
-sequence counter every round.
+runs 100 rounds - four messages 500ms apart, then a 5s gap - restarting each
+device's sequence counter every round, then goes quiet.
+
+It waits 30s before the first push. The fixture flashes board B first and board
+A second, and an image takes about 50s to upload at 115200 baud, so board B is
+running for the better part of a minute before the receiver exists. Pushing into
+that gap NACKs harmlessly; the delay only trims the noise.
+
+A failed push logs an error code:
+
+| Code | Meaning |
+|:-----|:--------|
+| `0x0004` | address NACK - nothing answered at `0x10` |
+| `0x0005` | data NACK |
+| `0x0007` - `0x000a` | arbitration loss, bus error, overrun, timeout |
+| `0x0100` - `0x0103` | IPC or client-side failure; never reached the bus |
+| `0x0200` | frame could not be encoded |
+
+Codes below `0x0100` are the I2C server's own `I2cError` values.
 
 ## Running
 
@@ -52,13 +75,22 @@ second up automatically from the `.slave.elf` symlink beside the first:
 | A | `bootlog_image` (receiver) | `[uart]`, `/dev/ttyUSB0` |
 | B | `bootlog_push_image` (sender) | `[device_b]`, `/dev/ttyUSB1` |
 
-Both UART streams are spliced into the same output, so board A's received lines
-and board B's pushed lines interleave.
+Console lines from both boards interleave, prefixed `A| ` and `B| `. Each board
+also gets its own detokenized log file - see
+[Per-board logs](../README.md#per-board-logs) - which is the easier way to read
+a run, since board A's received lines and board B's pushed lines are separated.
 
-There is no PASS/FAIL sentinel - the receiver loops forever - so the test runs
-until `Ctrl-C` or the `eternal` timeout. Fixture setup (Pi wiring, SSH keys,
-lockfile behavior) is identical to the MCTP server test; see
-[that README](../mctp/server/README.md).
+The receiver passes once it has recorded 4 messages from 2 distinct devices -
+one full push round - dumping the per-device logs before it shuts down. Failing
+to reach that within `--duration 240` fails the test. That budget is about 105s
+of flashing both boards, the pusher's 30s startup delay, and the pushing that
+follows.
+
+A pass means the messages were decoded and attributed to the right device by
+payload identity, since the EID is null for every sender.
+
+Fixture setup (Pi wiring, SSH keys, lockfile behavior) is identical to the MCTP
+server test; see [that README](../mctp/server/README.md).
 
 Expected output from board A once messages start arriving:
 
@@ -71,8 +103,22 @@ vendor=0x00001234 device=0x0001.0 seq=2 t=9000us code=0x8003 vendor_code=0x00f1
 vendor=0x00001234 device=0x0002.1 seq=0 t=2000us code=0x7fff vendor_code=0x0099
 ```
 
-Those four lines are one push round. Board B logs a matching `pushed ...` line
-for each. Anything that is not boot status - wrong message type, integrity check
+Those four lines are one push round, after which the receiver dumps what it
+kept and shuts down:
+
+```
+recorded 4 of 4 deliveries from 2 devices
+device vendor=0x00001234 id=0x0001.0 entries=3 overwritten=0
+  seq=0 t=1000us code=0x0001 vendor_code=0x0011
+  seq=2 t=9000us code=0x8003 vendor_code=0x00f1
+  seq=1 t=5000us code=0x0002 vendor_code=0x0012
+device vendor=0x00001234 id=0x0002.1 entries=1 overwritten=0
+  seq=0 t=2000us code=0x7fff vendor_code=0x0099
+```
+
+Entry order is first message, then first error, then recent history - which is
+why `seq=2` precedes `seq=1` for device A. Board B logs a matching `pushed ...`
+line for each message. Anything that is not boot status - wrong message type, integrity check
 bit set, payload too short - is logged as an error and discarded rather than
 recorded.
 

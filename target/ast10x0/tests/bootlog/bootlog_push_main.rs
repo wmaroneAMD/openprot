@@ -15,7 +15,7 @@
 
 use app_bootlog_push::handle;
 use embedded_hal::i2c::I2c;
-use i2c_client::I2cClient;
+use i2c_client::{ClientError, I2cClient};
 use i2c_client_ipc::IpcTransport;
 use mctp_lib::i2c::MctpI2cEncap;
 use openprot_bootlog::{BootLogTransport, DeviceIdentity, MSG_LEN, Sender, code};
@@ -32,44 +32,84 @@ const PROT_I2C_ADDR: u8 = 0x10;
 /// header version 1, null destination and source EIDs, SOM | EOM | TO.
 const MCTP_HEADER: [u8; 4] = [0x01, 0x00, 0x00, 0xC8];
 
+/// Encoded frame: I2C header, MCTP header, message, PEC.
+const FRAME_LEN: usize = 4 + MCTP_HEADER.len() + MSG_LEN + 1;
+
+/// Rounds to push before going quiet.
+const ROUNDS: u32 = 100;
+
 /// Gap between messages, long enough to read the receiver's log.
 const MSG_GAP: Duration = Duration::from_millis(500);
 
 /// Gap between rounds.
 const ROUND_GAP: Duration = Duration::from_millis(5000);
 
+/// Delay before the first push.
+///
+/// The fixture flashes this board first, then the receiver, and an image takes
+/// about 50s to upload at 115200 baud. Pushing before the receiver has booted
+/// and armed its I2C slave just NACKs, which is harmless but noisy.
+const STARTUP_DELAY: Duration = Duration::from_millis(30_000);
+
+/// Why a push did not reach the bus.
+#[derive(Debug, Clone, Copy)]
+enum PushError {
+    /// The frame could not be built. Not expected for a fixed-size message.
+    Encode,
+    /// The bus write failed.
+    Write(ClientError),
+}
+
+impl PushError {
+    /// A code for the log. Values below `0x100` are the server's own
+    /// `I2cError` - `0x04` address NACK, `0x05` data NACK, `0x0A` timeout -
+    /// and the rest are client-side failures that never reached the bus.
+    fn code(self) -> u32 {
+        match self {
+            PushError::Encode => 0x200,
+            PushError::Write(ClientError::ServerError(err)) => err as u32,
+            PushError::Write(ClientError::Transport(_)) => 0x100,
+            PushError::Write(ClientError::InvalidResponse) => 0x101,
+            PushError::Write(ClientError::BufferTooSmall) => 0x102,
+            PushError::Write(ClientError::TooManyOperations) => 0x103,
+        }
+    }
+}
+
 /// Sends boot status messages as MCTP-over-SMBus frames.
-struct I2cPush<C: I2c<u8>> {
-    i2c: C,
+struct I2cPush {
+    i2c: I2cClient<IpcTransport>,
     encap: MctpI2cEncap,
 }
 
-impl<C: I2c<u8>> I2cPush<C> {
-    fn new(i2c: C) -> Self {
+impl I2cPush {
+    fn new() -> Self {
         Self {
-            i2c,
+            i2c: I2cClient::new(IpcTransport::new(handle::I2C)),
             encap: MctpI2cEncap::new(OWN_I2C_ADDR),
         }
     }
 }
 
-impl<C: I2c<u8>> BootLogTransport for I2cPush<C> {
-    type Error = ();
+impl BootLogTransport for I2cPush {
+    type Error = PushError;
 
     fn send(&mut self, msg: &[u8; MSG_LEN]) -> Result<(), Self::Error> {
         let mut pkt = [0u8; MCTP_HEADER.len() + MSG_LEN];
         pkt[..MCTP_HEADER.len()].copy_from_slice(&MCTP_HEADER);
         pkt[MCTP_HEADER.len()..].copy_from_slice(msg);
 
-        let mut frame = [0u8; MCTP_HEADER.len() + MSG_LEN + 8];
+        let mut frame = [0u8; FRAME_LEN];
         let frame = self
             .encap
             .encode(PROT_I2C_ADDR, &pkt, &mut frame, true)
-            .map_err(|_| ())?;
+            .map_err(|_| PushError::Encode)?;
 
         // encode() emits the full frame starting at the destination address;
         // embedded-hal adds that byte itself, so skip it here.
-        self.i2c.write(PROT_I2C_ADDR, &frame[1..]).map_err(|_| ())
+        self.i2c
+            .write(PROT_I2C_ADDR, &frame[1..])
+            .map_err(PushError::Write)
     }
 }
 
@@ -99,8 +139,7 @@ fn sleep(duration: Duration) {
 
 /// Pushes one device's messages, with a fresh sequence counter each round.
 fn push(identity: DeviceIdentity, messages: &[Message]) {
-    let transport = I2cPush::new(I2cClient::new(IpcTransport::new(handle::I2C)));
-    let mut sender = Sender::new(transport, identity);
+    let mut sender = Sender::new(I2cPush::new(), identity);
 
     for &(timestamp_us, code, vendor_code) in messages {
         match sender.report(timestamp_us, code, vendor_code) {
@@ -110,31 +149,57 @@ fn push(identity: DeviceIdentity, messages: &[Message]) {
                 identity.instance as u32,
                 code as u32
             ),
-            Err(()) => pw_log::error!(
-                "push failed device=0x{:04x}.{} code=0x{:04x}",
+            Err(err) => pw_log::error!(
+                "push failed device=0x{:04x}.{} code=0x{:04x} err=0x{:04x}",
                 identity.device_id as u32,
                 identity.instance as u32,
-                code as u32
+                code as u32,
+                err.code() as u32
             ),
         }
         sleep(MSG_GAP);
     }
 }
 
+/// Configures this board's own I2C address before mastering the bus.
+///
+/// The MCTP server does this on every board that works; a controller left
+/// without its own address configured NACKs what it sends.
+fn configure_bus() -> Result<(), ClientError> {
+    let mut client = I2cClient::new(IpcTransport::new(handle::I2C));
+    client.configure_slave(OWN_I2C_ADDR)?;
+    client.enable_slave()
+}
+
 #[entry]
 fn entry() {
-    pw_log::info!("boot log dummy sender starting");
+    pw_log::info!(
+        "boot log dummy sender starting: src=0x{:02x} dest=0x{:02x} frame={} bytes",
+        OWN_I2C_ADDR as u32,
+        PROT_I2C_ADDR as u32,
+        FRAME_LEN as u32
+    );
 
-    // Let the receiving board finish booting and register its listener.
-    sleep(ROUND_GAP);
+    if let Err(err) = configure_bus() {
+        pw_log::error!(
+            "i2c configure failed: err=0x{:04x}",
+            PushError::Write(err).code() as u32
+        );
+    }
 
-    let mut round: u32 = 0;
-    loop {
+    // Let the receiving board finish flashing, boot, and register its listener.
+    sleep(STARTUP_DELAY);
+
+    for round in 1..=ROUNDS {
         push(identity(0x0001, 0), &DEVICE_A);
         push(identity(0x0002, 1), &DEVICE_B);
 
-        round += 1;
-        pw_log::info!("push round {} complete", round as u32);
+        pw_log::info!("push round {} of {} complete", round as u32, ROUNDS as u32);
+        sleep(ROUND_GAP);
+    }
+
+    pw_log::info!("push complete after {} rounds", ROUNDS as u32);
+    loop {
         sleep(ROUND_GAP);
     }
 }

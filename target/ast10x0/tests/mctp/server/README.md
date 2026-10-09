@@ -170,8 +170,11 @@ If your Pi wiring differs, edit `evb_config.toml` before running the test.
 
 ## Troubleshooting
 
->We are currently aware of an issue where occasionally the spliced UART streams
->get corrupt each other so that one line from each becomes unreadable.
+>Spliced UART streams used to corrupt each other, leaving one line from each
+>board unreadable. Both ports are now line-buffered and tagged on the Pi, so
+>console lines are prefixed `A| ` / `B| ` and each board also gets its own
+>detokenized log file. See
+>[Per-board logs](../../README.md#per-board-logs).
 
 **`ssh: connect to host ... port 22: Connection refused`**
 : The Pi is unreachable. Check that the hostname is correct and the Pi is powered on.
