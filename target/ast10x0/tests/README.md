@@ -39,6 +39,26 @@ Key-based SSH auth is required (`ssh-copy-id <user>@<pi-host>`). The Pi runs
 the UART bootloader, and sentinel detection. UART output is streamed back to
 the host for detokenization and display. Tests no longer use cortex_m_semihosting.
 
+### Per-board logs
+
+Each board's output is also written to its own detokenized log file, named
+`<image>_<board>_<device>_<timestamp>.log`:
+
+```
+bootlog_image_A_ttyUSB0_20260930-152233.log
+bootlog_push_image_B_ttyUSB1_20260930-152233.log
+```
+
+They land in `$TEST_UNDECLARED_OUTPUTS_DIR` when Bazel sets it, otherwise the
+current directory; `--log-dir` overrides. The paths are printed to stderr as
+`RUNNER: board A log -> ...` when the run starts.
+
+On the console both boards still share one stream, each line prefixed `A| ` or
+`B| `. `pi_test_runner.py` buffers each port and writes one whole line at a
+time, so a line from one board can no longer land inside a line from the other
+— which used to break detokenization, since a `$`-prefixed token split in half
+cannot be decoded.
+
 ### Physical AST1060 EVB wired (not yet implemented)
 
 A wired mode — where the host connects to the Pi fixture over a local serial
